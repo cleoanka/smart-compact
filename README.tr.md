@@ -70,7 +70,7 @@ Kural önemlidir: o olmadan model işaretlerin varlığını bilmez; yalnız kom
 
 Betiği yeniden çalıştırmak mevcut kurulumu günceller, hiçbir şeyi çoğaltmaz. Bu adlardan biriyle kendi komutun zaten varsa (örneğin `/drop`), kurulum ona dokunmaz ve smart-compact o komutu yakalamaz.
 
-**Gereksinimler:** Python 3.8 ya da üstü ve `PreCompact`, `PostCompact`, `SessionStart`, `UserPromptExpansion`, `Stop` hook'larını destekleyen bir Claude Code sürümü. macOS üzerinde Claude Code 2.1.325 ile geliştirildi ve denendi.
+**Gereksinimler:** Python 3.9 ya da üstü ve `PreCompact`, `PostCompact`, `SessionStart`, `UserPromptExpansion`, `Stop` hook'larını destekleyen bir Claude Code sürümü. macOS üzerinde Claude Code 2.1.325 ile geliştirildi ve denendi.
 
 ## Kullanım
 

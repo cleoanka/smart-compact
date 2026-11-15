@@ -235,8 +235,8 @@ def main() -> int:
                     or os.path.join(os.path.expanduser("~"), ".claude"))
     args = ap.parse_args()
 
-    if sys.version_info < (3, 8):
-        print("smart-compact needs Python 3.8 or newer.", file=sys.stderr)
+    if sys.version_info < (3, 9):
+        print("smart-compact needs Python 3.9 or newer.", file=sys.stderr)
         return 1
 
     cfg = os.path.abspath(args.config_dir)

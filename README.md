@@ -70,7 +70,7 @@ The rule matters: without it the model does not know the marks exist, and only t
 
 Running the installer again updates an existing install without duplicating anything. If you already have your own command with one of these names, such as `/drop`, the installer leaves it alone and smart-compact does not intercept it.
 
-**Requirements:** Python 3.8 or newer, and a Claude Code version with the `PreCompact`, `PostCompact`, `SessionStart`, `UserPromptExpansion` and `Stop` hooks. Developed and tested on Claude Code 2.1.325 on macOS.
+**Requirements:** Python 3.9 or newer, and a Claude Code version with the `PreCompact`, `PostCompact`, `SessionStart`, `UserPromptExpansion` and `Stop` hooks. Developed and tested on Claude Code 2.1.325 on macOS.
 
 ## Use
 
