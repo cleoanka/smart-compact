@@ -141,7 +141,21 @@ class Marks(Base):
     def test_no_output_when_nothing_to_say(self):
         self.write([entry("assistant", "nothing marked", "2026-01-01T00:00:01Z")])
         self.assertEqual(self.run_hook("pre", trigger="manual", custom_instructions=""), "")
-        self.assertEqual(self.restored(), "")
+        ctx = self.restored()  # no pins: only the short recall instruction
+        self.assertNotIn("◆", ctx)
+        self.assertIn(" recall ", ctx)
+        self.assertLess(len(ctx), 700)
+
+    def test_a_discard_mark_never_beats_a_pin(self):
+        self.write([
+            entry("assistant", "◆ Constraint: output goes to out/report.csv", "2026-01-01T00:00:01Z"),
+            entry("assistant", "◇ out/report.csv\n◇ everything about: Constraint: output goes to out/report.csv\n"
+                               "◇ the scratch notebook", "2026-01-01T00:00:02Z"),
+        ])
+        out = self.run_hook("pre", trigger="auto")
+        self.assertEqual(self.saved()["drops"], ["the scratch notebook"])
+        self.assertNotIn("report.csv", out)
+        self.assertIn("1 items were marked", self.restored())
 
     def test_discard_list_is_bounded(self):
         self.write([entry("assistant", "\n".join(f"◇ item {i} " + "x" * 400 for i in range(40)),
@@ -295,6 +309,62 @@ class AutoCompact(Base):
         self.run_hook("stop", env=env)
         self.assertFalse(os.path.exists(run + ".thrash"))
         self.assertTrue(os.path.exists(run + ".trigger"))
+
+
+class Recall(Base):
+    def recall(self, *args):
+        p = subprocess.run([sys.executable, "-I", SCRIPT, "recall", *args], capture_output=True, text=True,
+                           env=self.env, stdin=subprocess.DEVNULL, timeout=20)
+        self.assertEqual((p.returncode, p.stderr), (0, ""))
+        return p.stdout
+
+    def setUp(self):
+        super().setUp()
+        big = "noise " * 20000 + "the API key rotates every 37 days " + "noise " * 20000
+        self.write([
+            entry("assistant", "Old note: rotation was 30 days", "2026-01-01T00:00:01Z"),
+            {"type": "user", "timestamp": "2026-01-01T00:00:02Z", "message": {"content": [
+                {"type": "tool_result", "content": big}]}},
+            {"type": "assistant", "timestamp": "2026-01-01T00:00:03Z", "message": {"content": [
+                {"type": "tool_use", "name": "Bash", "input": {"command": "curl https://example.test/rotation"}}]}},
+            entry("user", "summary mentions rotation", "2026-01-01T00:00:04Z", isCompactSummary=True),
+        ])
+
+    def test_prints_a_small_window_not_the_line(self):
+        out = self.recall(self.transcript, "rotates", "37")
+        self.assertIn("the API key rotates every 37 days", out)
+        self.assertIn("[line 2 2026-01-01T00:00 tool_result]", out)
+        self.assertLess(len(out), 800)  # the transcript line is about 240,000 characters
+
+    def test_newest_first_all_words_required_and_summaries_skipped(self):
+        out = self.recall(self.transcript, "ROTATION")
+        self.assertLess(out.index("tool_use Bash"), out.index("Old note"))
+        self.assertNotIn("summary mentions", out)
+        self.assertIn("no match", self.recall(self.transcript, "rotation", "zebra"))
+
+    def test_total_output_is_capped(self):
+        self.write([entry("assistant", f"match number {i} " + "z" * 500, "2026-01-01T00:00:01Z") for i in range(200)])
+        out = self.recall(self.transcript, "match", "-n", "20")
+        self.assertLess(len(out), 4400)
+        self.assertIn("older matches not shown", out)
+        self.assertIn("match number 199", out)
+
+    def test_line_paging(self):
+        out = self.recall(self.transcript, "--line", "2")
+        self.assertLess(len(out), 3200)
+        self.assertIn("more characters: --at 3000", out)
+        self.assertIn("noise", self.recall(self.transcript, "--line", "2", "--at", "3000"))
+        self.assertIn("no such line", self.recall(self.transcript, "--line", "99"))
+
+    def test_discards_and_bad_calls(self):
+        self.write([entry("assistant", "◇ the scratch notebook", "2026-01-01T00:00:01Z")])
+        os.rename(self.transcript, os.path.join(self.tmp.name, SID + ".jsonl"))
+        self.transcript = os.path.join(self.tmp.name, SID + ".jsonl")
+        self.run_hook("pre", trigger="auto")
+        self.assertEqual(self.recall(self.transcript, "--discards").strip(), "◇ the scratch notebook")
+        self.assertIn("usage", self.recall())
+        self.assertIn("not found", self.recall("/nonexistent.jsonl", "x"))
+        self.assertIn("usage", self.recall(self.transcript))
 
 
 class Robustness(Base):

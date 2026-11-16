@@ -40,7 +40,25 @@ yanıt metni ─► oturum kaydı (diskte .jsonl, asla yeniden yazılmaz)
 - **POINTER**, tek satır: işe yarayabilecek şeyler `ne -> nerede` biçimine iner (bir yol ya da "transcript"). Model emin değilse bu kademeyi seçmek zorundadır.
 - **DROP**: ham araç çıktısı, dosya içerikleri, yerini yenisine bırakmış denemeler.
 
-Hiçbir şey gerçekten kaybolmaz. Compact, kayıt dosyasının sonuna ekleme yapar, dosyayı yeniden yazmaz; tam geçmiş diskte durur ve dosyanın yolu pinlerle birlikte modele verilir.
+Hiçbir şey gerçekten kaybolmaz. Compact, kayıt dosyasının sonuna ekleme yapar, dosyayı yeniden yazmaz; tam geçmiş diskte durur.
+
+### Kayıttan geri okumak, bedelini ödemeden
+
+Kayıt dosyası okunacak bir şey değildir. Her satır bütün bir mesajdır; araç çıktısı taşıyan bir satır on binlerce karakter olabilir. Model bir ayrıntı için dosyayı grep'lerse satırın tamamı context'e girer ve sonraki her turda yeniden okunur.
+
+Bu yüzden hook, her compact'tan sonra modele çıplak dosya yolu yerine bir `recall` komutu verir:
+
+```
+smart-compact.py recall <kayıt> retry_budget degraded
+[line 212 2026-11-15T10:08 tool_result] …status=ok latency_ms=412 2026-11-15T10:08:37 worker=12 shard=k7 status=degraded retry_budget=17 owner=team-osprey 2026-11-15T10:08:38 worker=3…
+```
+
+- Bütün kelimeler aynı mesajda geçmelidir. En yeni eşleşmeler önce gelir.
+- Her eşleşme, eşleşen yerin etrafında yaklaşık 480 karakterlik bir pencereye kesilir. Eşleşen satırlar ne kadar büyük olursa olsun tek çağrı en çok 6 eşleşme ve 4.000 karakter basar.
+- Parça yetmezse `--line N [--at OFFSET]` tek bir mesajı 3.000 karakterlik sayfalarla gezer.
+- `--discards`, son compact'ta dışarıda bırakılması istenenleri listeler; bir silme işareti yanlış çıkarsa buradan bulunur.
+
+Yanıt metinlerinde, araç girdilerinde, araç çıktılarında ve kabuk çıktısında arar. Dosya üzerinde düz bir metin aramasıdır: dizin yok, model çağrısı yok.
 
 ## Kurulum
 
@@ -145,11 +163,12 @@ Başka terminallerde `/smartcompact` yazman gereken komutu gösterir, akıllı o
 - **Model çağrısı eklemez.** İşaretler, modelin zaten yazmakta olduğu yanıtın içindeki birkaç karakterdir. Komutları hook yanıtlar.
 - **Normal çalışmada cache'i bozmaz.** Sistem promptunu, araç listesini ya da önceki mesajları değiştirmez; [prompt cache'i geçersiz kılan](https://code.claude.com/docs/en/prompt-caching.md#actions-that-invalidate-the-cache) şeyler bunlardır.
 - **`CLAUDE.md` içindeki kural**: yaklaşık 450 token sabit context; proje bağlamının geri kalanıyla birlikte cache'lenir.
-- **Compact sırasında**: özet isteğine en çok yaklaşık 1.600 karakter politika ve 3.400 karakter silme listesi eklenir; ardından en çok 8.000 karakter pin geri yüklenir. Pin ve işaret yoksa hiçbir şey eklenmez.
+- **Compact sırasında**: özet isteğine en çok yaklaşık 1.700 karakter politika ve 3.400 karakter silme listesi eklenir; ardından en çok 8.000 karakter pin geri yüklenir, recall komutu için de yaklaşık 500 karakter.
 
 ### Ne kazandırır
 
 - **Özet küçükse sonraki her tur ucuzlar.** Claude Code her turda konuşmanın tamamını yeniden gönderir ve onu yeniden okumak için cache'li token ücreti öder; özetin taşıdığı her şey, sıradaki compact'a kadar her turda yeniden ödenir. Silinenler ve tek satıra inen işaretçiler bunu küçültür.
+- **Bir şeye bakmak küçük kalır.** `recall`, kayıt satırının tamamını değil eşleşmenin etrafındaki pencereyi döndürür; bir arama context'e, geldiği araç çıktısının tamamını değil birkaç yüz token ekler.
 - **Tekrarlanan hatalar azalır.** Kaybolan bir kısıtın bedeli token'dan çok daha fazladır: model işi yeniden yapar ya da koyduğun kuralı çiğner. Pinler, özeti yazan modelin kararından bağımsız olarak kelimesi kelimesine geri gelir.
 - **Daha erken ve senin istediğin anda compact.** 900K token'a ulaşan bir oturum her turda 900K'ya kadar cache'li token okur. Daha düşük bir akıllı sınır her turu küçük tutar.
 - **Cache sıcakken compact.** Özet isteği, [cache sıcakken geçmişi cache'ten okur, soğukken tam fiyattan yeniden işler](https://code.claude.com/docs/en/prompt-caching.md#compacting-the-conversation). Akıllı oto, turun sonunda, cache az önce kullanılmışken tetiklenir.
@@ -161,6 +180,7 @@ Başka terminallerde `/smartcompact` yazman gereken komutu gösterir, akıllı o
 - Normal otomatik compact penceresi kullanıcı düzeyindeki `settings.json` dosyasından ve ortam değişkenlerinden okunur; bulunamazsa yaklaşık 967K varsayılır. 200K context'li bir modelde ya da pencere proje veya yönetilen ayarlarda tanımlıysa, akıllı sınırı gerçek pencerenin altına kendin koy.
 - `/compact smart` komutunu senin yerine yazmak bir tuş gönderimidir. O anda yeni bir istem yazıyorsan metin taslağına karışır.
 - `/pin` ile eklenen pinler oturum kimliğine bağlıdır. Çatallanan ya da yeni kimlikle sürdürülen bir oturum, kayıtta yazılı pinleri taşır; komutla eklenenleri taşımaz.
+- Bir pini anan ya da bir pin tarafından anılan silme işareti yok sayılır: koruma, silmeye üstün gelir. Bunun ötesinde hook, bir işaretin isabetli olup olmadığını bilemez.
 - Silme listesi bir dil modeline verilen talimattır. Aşağıdaki testlerin hepsinde uyuldu, ayrıca hook, işaretlenen satırlardan kaçının özete geri alıntılandığını kaydeder (`log.jsonl` içinde `drop_leaks`); ama pinler gibi kesin bir garanti değildir.
 
 ## Güvenlik notu
@@ -179,6 +199,7 @@ Gerçek oturumlar, Claude Code 2.1.325, macOS:
 | O oturumda özet boyutu | Akıllı 4.544 karakter, normal 6.257 karakter |
 | `/drop` ardından düz `/compact` | İşaretlenen öğe özetten çıktı; pinler geri geldi; daha önce kullanılmış eski `◇` yeniden listelenmedi |
 | Komutlar | Model çağrısı yok |
+| Compact sonrası recall (Opus 5.5): 800 satırlık bir log okundu, oturum compact edildi, dosya silindi, ardından sıradan bir satır soruldu | Model `recall` komutunu kendiliğinden bir kez çalıştırdı ve doğru yanıtladı. Araç çıktısı 1.001 karakterdi; dosyayı taşıyan kayıt satırı yaklaşık 40.000 karakter |
 
 Bu rakamları olduğu gibi oku: yaklaşık 62K token'lık tek bir küçük oturum. Bu boyutta token farkı ihmal edilebilir düzeydedir ve normal özet de pinlenen bilgileri tesadüfen tutmuştu. Boyut karşılaştırması, yan yana ölçmediğim uzun oturumlar için kesin bir şey söylemez.
 

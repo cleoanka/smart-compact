@@ -7,6 +7,7 @@ Hook modes (stdin = hook input JSON):
   post    PostCompact          log, save the generated summary, prune old state
   expand  UserPromptExpansion  the slash commands below, handled without a model call
   stop    Stop                 smart auto-compact: trigger when context passes the smart window
+  recall  (run by the model)   print short snippets from the transcript instead of reading it
 
 Marks, read from the session transcript at compaction time:
   "◆ <text>"   pin      carried verbatim through EVERY compaction (native or smart)
@@ -27,6 +28,7 @@ Never blocks or breaks compaction: every failure exits 0.
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -52,6 +54,11 @@ NO_1M_WINDOW = 200_000
 DEFAULT_SMART_WINDOW = 300_000
 MIN_WINDOW = 100_000            # same floor as Claude Code's own auto-compact window
 RETRIGGER_SECONDS = 180
+RECALL_HITS = 6                 # snippets printed by one recall
+RECALL_HITS_MAX = 20
+RECALL_BEFORE, RECALL_AFTER = 160, 320   # characters kept around a match
+RECALL_TOTAL = 4000             # hard cap on what one recall prints
+RECALL_LINE_CHARS = 3000        # one "--line" page
 STATE_MAX_AGE_DAYS = 30
 LOG_MAX_BYTES = 1_000_000
 
@@ -66,7 +73,7 @@ Three tiers:
 
 Pinned items (lines starting with "◆") are re-injected verbatim right after compaction; do not copy them into the summary.
 The hook tracks pins itself, including changes made in the latest messages that you cannot see: do not judge which pins are still valid, and do not ask for a pin to be retired or rewritten.
-The full pre-compaction transcript stays on disk; anything dropped can be recovered from it.
+The full pre-compaction transcript stays on disk and a recall command is given to the assistant after compaction; anything dropped can be recovered from it, so do not keep bulky material "just in case".
 """
 
 OVERFLOW_HEAD = """PIN OVERFLOW (smart-compact). The pinned lines below do not fit the space the hook has for re-injecting pins. Copy each of them into the summary word for word, under a heading "Pinned (overflow)", keeping the leading "◆".
@@ -405,6 +412,9 @@ def effective_marks(data: dict, transcript_path: str):
                 drops.append(text)
         elif kind == "undrop":
             drops = [d for d in drops if d != text]
+    # protecting beats discarding: a discard mark that names a pin, or is named by one, is ignored
+    low_pins = [p.lower() for p in pins]
+    drops = [d for d in drops if not any(d.lower() in p or p in d.lower() for p in low_pins)]
     return pins, drops
 
 
@@ -570,17 +580,24 @@ def mode_start(data: dict) -> None:
         if not isinstance(saved, dict):
             return
         pins = saved.get("pins") or []
-        tp = saved.get("transcript_path") or data.get("transcript_path") or ""
-        if not pins:
-            return  # nothing to carry; stay silent, cost nothing
         if not isinstance(pins, list):
-            return
+            pins = []
+        drops = saved.get("drops") or []
+        tp = saved.get("transcript_path") or data.get("transcript_path") or ""
         omitted = int(saved.get("overflow") or 0)
         lines = [PIN + " " + p for p in pins]
-        head = ["SMART-COMPACT: pinned items carried over verbatim (chronological; on conflict the later one wins)."]
+        head = []
+        if pins:
+            head.append("SMART-COMPACT: pinned items carried over verbatim (chronological; on conflict the later one wins).")
         if omitted:
             head.append(f"({omitted} older pins did not fit here; the summary carries them under 'Pinned (overflow)'.)")
-        tail = [f"Full pre-compaction transcript (JSONL, grep it when a summary pointer needs detail): {tp}"]
+        recall = f"{shlex.quote(sys.executable)} -I {shlex.quote(os.path.abspath(__file__))} recall {shlex.quote(tp)}"
+        tail = ["SMART-COMPACT recall: when you need a detail from before the compaction, do not Read or grep the "
+                "transcript (its lines are huge). Run this, with a few distinctive words, and it prints short snippets:",
+                f"  {recall} <words>"]
+        if drops:
+            tail.append(f"({len(drops)} items were marked \"{DISCARD}\" as worthless and left out of the summary on purpose; "
+                        f"if one turns out to matter, list them with: recall … --discards)")
         ctx = "\n".join(head + lines + tail)
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}},
                          ensure_ascii=False))
@@ -812,6 +829,133 @@ def mode_stop(data: dict) -> None:
         log({"ev": "stop-error", "err": repr(e)})
 
 
+# ---------- recall: read little, read exactly ----------
+
+def recall_chunks(entry: dict):
+    """Yield (kind, text) for everything in one transcript entry that could hold a detail."""
+    etype = entry.get("type")
+    if etype not in ("user", "assistant") or entry.get("isCompactSummary"):
+        return
+    content = (entry.get("message") or {}).get("content")
+    if isinstance(content, str):
+        content = [{"type": "text", "text": content}]
+    if not isinstance(content, list):
+        return
+    for b in content:
+        if not isinstance(b, dict):
+            continue
+        t = b.get("type")
+        if t == "text":
+            text = b.get("text") or ""
+            if not text.lstrip().startswith(("<system-reminder>", "<command-", "<local-command", "<task-notification>")):
+                yield etype, text  # shell output ("<bash-…>") stays searchable
+        elif t == "tool_use":
+            yield "tool_use " + str(b.get("name") or ""), json.dumps(b.get("input"), ensure_ascii=False)
+        elif t == "tool_result":
+            c = b.get("content")
+            if isinstance(c, list):
+                c = "\n".join(str(x.get("text") or "") for x in c if isinstance(x, dict))
+            if isinstance(c, str) and c:
+                yield "tool_result", c
+
+
+def flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+def recall_search(path: str, words, limit: int) -> str:
+    """Newest matches first: entries in which every word occurs, cut to a window around the first one."""
+    terms = [w.lower() for w in words if w]
+    hits, total = [], 0
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for n, raw in enumerate(f, 1):
+            low_raw = raw.lower()
+            if not all(t in low_raw for t in terms):  # fast path; JSON escaping can hide a match, never invent one
+                continue
+            try:
+                entry = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            for kind, text in recall_chunks(entry):
+                low = text.lower()
+                if not all(t in low for t in terms):
+                    continue
+                total += 1
+                at = low.find(terms[0])
+                a, b = max(0, at - RECALL_BEFORE), min(len(text), at + RECALL_AFTER)
+                snippet = ("…" if a else "") + flat(text[a:b]) + ("…" if b < len(text) else "")
+                hits.append(f"[line {n} {str(entry.get('timestamp') or '')[:16]} {kind}] {snippet}")
+                hits = hits[-limit:]
+    if not hits:
+        return "no match. Try fewer or different words (every word must occur in the same message)."
+    out, used = [], 0
+    for h in reversed(hits):
+        if used + len(h) > RECALL_TOTAL:
+            break
+        out.append(h)
+        used += len(h) + 1
+    more = total - len(out)
+    if more > 0:
+        out.append(f"(+{more} older matches not shown; add a word to narrow)")
+    out.append("(more of one message: recall <transcript> --line N [--at OFFSET])")
+    return "\n".join(out)
+
+
+def recall_line(path: str, number: int, offset: int) -> str:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for n, raw in enumerate(f, 1):
+            if n != number:
+                continue
+            try:
+                entry = json.loads(raw)
+            except Exception:
+                return "that line is not readable JSON."
+            text = "\n\n".join(f"[{kind}]\n{t}" for kind, t in recall_chunks(entry)) if isinstance(entry, dict) else ""
+            if not text:
+                return "that line holds no message text."
+            page = text[offset:offset + RECALL_LINE_CHARS]
+            rest = len(text) - offset - len(page)
+            return page + (f"\n(+{rest} more characters: --at {offset + len(page)})" if rest > 0 else "")
+    return "no such line."
+
+
+def mode_recall(argv) -> None:
+    usage = ("usage: recall <transcript.jsonl> <words…> [-n COUNT]\n"
+             "       recall <transcript.jsonl> --line N [--at OFFSET]\n"
+             "       recall <transcript.jsonl> --discards")
+    try:
+        if not argv or not os.path.isfile(argv[0]):
+            print(usage if not argv else f"transcript not found: {argv[0]}")
+            return
+        path, rest = argv[0], argv[1:]
+        opts, words, i = {}, [], 0
+        while i < len(rest):
+            if rest[i] in ("-n", "--line", "--at") and i + 1 < len(rest) and rest[i + 1].isdigit():
+                opts[rest[i]] = int(rest[i + 1])
+                i += 2
+            elif rest[i] == "--discards":
+                opts["--discards"] = 1
+                i += 1
+            else:
+                words.append(rest[i])
+                i += 1
+        if "--discards" in opts:
+            key = os.path.splitext(os.path.basename(path))[0]
+            saved = read_json(os.path.join(PIN_DIR, session_key({"session_id": key}) + ".json"), {})
+            drops = saved.get("drops") or [] if isinstance(saved, dict) else []
+            print("\n".join(f"{DISCARD} {d}" for d in drops) if drops else "no discard marks were used in the last compaction.")
+        elif "--line" in opts:
+            print(recall_line(path, opts["--line"], opts.get("--at", 0)))
+        elif words:
+            print(recall_search(path, words, max(1, min(opts.get("-n", RECALL_HITS), RECALL_HITS_MAX))))
+        else:
+            print(usage)
+    except Exception as e:
+        print(f"recall failed: {e!r}")
+
+
 MODES = {"pre": mode_pre, "start": mode_start, "post": mode_post, "expand": mode_expand, "stop": mode_stop}
 
 
@@ -821,6 +965,9 @@ def main() -> None:
     except Exception:
         pass
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
+    if mode == "recall":  # run from a shell by the model: arguments, no hook JSON on stdin
+        mode_recall(sys.argv[2:])
+        return
     try:
         data = json.load(sys.stdin)
     except Exception:

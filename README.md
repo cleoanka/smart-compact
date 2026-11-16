@@ -40,7 +40,25 @@ For unmarked material, a smart compaction asks the summarizer one question per i
 - **POINTER**, one line: plausibly useful things, reduced to `what -> where` (a path, or "transcript"). When the summarizer is unsure, it must choose this tier.
 - **DROP**: raw tool output, file contents, superseded attempts.
 
-Nothing is truly lost. Compaction appends to the transcript file and never rewrites it, so the full history stays on disk, and the path is handed to the model together with the pins.
+Nothing is truly lost. Compaction appends to the transcript file and never rewrites it, so the full history stays on disk.
+
+### Reading it back without paying for it
+
+A transcript is a bad thing to read. Each line is one whole message, and a line that holds a tool result can be tens of thousands of characters. If the model greps the file for a detail, the entire line enters the context and is then re-read on every later turn.
+
+So after each compaction the hook gives the model a `recall` command instead of the bare path:
+
+```
+smart-compact.py recall <transcript> retry_budget degraded
+[line 212 2026-11-15T10:08 tool_result] …status=ok latency_ms=412 2026-11-15T10:08:37 worker=12 shard=k7 status=degraded retry_budget=17 owner=team-osprey 2026-11-15T10:08:38 worker=3…
+```
+
+- Every word must occur in the same message. Newest matches come first.
+- Each hit is cut to a window of about 480 characters around the match. One call prints at most 6 hits and 4,000 characters, however large the matching lines are.
+- `--line N [--at OFFSET]` pages through one message, 3,000 characters at a time, when a snippet is not enough.
+- `--discards` lists what the last compaction was told to leave out, in case a discard mark turns out to have been wrong.
+
+It searches reply text, tool inputs, tool results and shell output. It is a plain substring search over the file: no index, no model call.
 
 ## Install
 
@@ -145,11 +163,12 @@ In any other terminal, `/smartcompact` shows you the command to type, and smart 
 - **No model calls.** Marks are a few characters in a reply the model is already writing. Commands are handled by a hook.
 - **No cache invalidation during normal work.** Nothing here changes the system prompt, the tool list or earlier messages, which are the things that [invalidate the prompt cache](https://code.claude.com/docs/en/prompt-caching.md#actions-that-invalidate-the-cache).
 - **The rule in `CLAUDE.md`**: about 450 tokens of standing context, cached with the rest of your project context.
-- **At compaction**: up to about 1,600 characters of policy and 3,400 characters of discard list in the summarization request, then at most 8,000 characters of pins re-injected afterwards. Sessions with no pins and no marks add nothing.
+- **At compaction**: up to about 1,700 characters of policy and 3,400 characters of discard list in the summarization request, then at most 8,000 characters of pins re-injected afterwards, plus about 500 characters for the recall command.
 
 ### What it saves
 
 - **Every later turn is cheaper when the summary is smaller.** Claude Code re-sends the whole conversation on each turn and pays the cached-token rate to re-read it, so whatever a summary carries is paid for again on every turn until the next compaction. Discarded material and one-line pointers shrink that.
+- **Looking something up stays small.** `recall` returns a window around the match instead of the transcript line, so a lookup adds a few hundred tokens to the context, not the whole tool result it came from.
 - **Fewer repeated mistakes.** A lost constraint costs far more than tokens: the model redoes work or breaks a rule you already set. Pins come back word for word, independent of what the summarizer decided.
 - **Compacting earlier, on your terms.** A session that runs to 900K tokens re-reads up to 900K cached tokens per turn. A lower smart limit keeps each turn smaller.
 - **Compacting while the cache is warm.** The summarization request [reads the history from the cache when it is warm and reprocesses it at full price when it is cold](https://code.claude.com/docs/en/prompt-caching.md#compacting-the-conversation). Smart auto triggers at the end of a turn, when the cache has just been used.
@@ -161,6 +180,7 @@ In any other terminal, `/smartcompact` shows you the command to type, and smart 
 - The native auto-compact window is read from your user `settings.json` and the environment, and assumed to be about 967K otherwise. On a 200K-context model, or when the window is set in project or managed settings, set a smart limit below the real window yourself.
 - Typing `/compact smart` for you is a keystroke injection. If you are already typing a new prompt at that moment, the text lands in your draft.
 - Pins made with `/pin` belong to the session id. A fork or a resume that gets a new id keeps the pins written in the transcript, not the ones added by command.
+- A discard mark that names a pin, or is named by one, is ignored: protecting wins over discarding. Beyond that the hook cannot tell whether a mark is wise.
 - The discard list is an instruction to a language model. It was followed in every test below, and the hook logs how many marked lines were quoted back into a summary (`drop_leaks` in `log.jsonl`), but it is not a hard guarantee the way pins are.
 
 ## Security note
@@ -179,6 +199,7 @@ Real sessions, Claude Code 2.1.325, macOS:
 | Summary size in that session | 4,544 characters smart, 6,257 native |
 | `/drop` followed by plain `/compact` | The dropped item disappeared from the summary; pins restored; an older, already-used `◇` was not listed again |
 | Commands | No model call |
+| Recall after compaction (Opus 5.5): an 800-line log was read, the session compacted, the file deleted, then an unremarkable line was asked for | The model ran `recall` once on its own and answered correctly. The tool result was 1,001 characters; the transcript line holding the file is about 40,000 |
 
 Read these numbers for what they are: one small session of about 62K tokens. At that size the token difference is negligible, and the native summary happened to keep the pinned facts too. The size comparison says nothing certain about long sessions, which I have not measured side by side.
 
